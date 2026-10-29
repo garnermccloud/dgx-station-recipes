@@ -1,0 +1,522 @@
+#!/usr/bin/env bash
+# ds41 — one command for the DeepSeek-V4.1-Flash-1017 serving recipe.
+# The lifecycle engine is serve/serve.sh; the checks are verify/verify.sh.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+. "$ROOT/serve/compat.sh"
+: "${DS41_HOME:=$HOME/.ds41}"
+CONFIG=${DS41_CONFIG:-$DS41_HOME/config.env}
+if [ -f "$CONFIG" ]; then . "$CONFIG"; fi
+: "${DS41_HOME:=$HOME/.ds41}"
+: "${DS41_CONFIG:=$CONFIG}"
+: "${DS41_MODEL_DIR:=$DS41_HOME/models/DeepSeek-V4.1-Flash-1017}"
+: "${DS41_MODEL_REV:=1bae0e1088993b9b82de08f59de5be5a34e42170}"
+: "${DS41_CACHE_DIR:=$DS41_HOME/state}"
+: "${DS41_FASTPATH_DIR:=$ROOT/fastpath}"
+: "${DS41_HOOK_DIR:=$DS41_FASTPATH_DIR/hook}"
+: "${DS41_B12X_DIR:=$ROOT/docker/b12x}"
+: "${DS41_PORT:=30003}"
+: "${DS41_API_KEY_FILE:=$DS41_HOME/api-key}"
+: "${DS41_SERVED:=deepseek-v4.1-flash}"
+: "${DS41_ALIASES:=deepseek DeepSeek-V4.1-Flash dsv41}"
+: "${DS41_IMAGE:=$DS41_SUPPORTED_IMAGE}"
+: "${DS41_OVERLAY_1017_DIR:=$ROOT/docker/overlay-1017/vllm}"
+: "${DS41_OVERLAY_58132_DIR:=$ROOT/docker/overlay-58132/vllm}"
+: "${DS41_SITECUSTOMIZE:=$ROOT/fastpath/sitecustomize.py}"
+: "${DS41_MIN_PCT:=80}"
+: "${DS41_MIN_ACC:=95}"
+export DS41_HOME DS41_CONFIG DS41_MODEL_DIR DS41_MODEL_REV DS41_CACHE_DIR
+export DS41_FASTPATH_DIR DS41_HOOK_DIR DS41_B12X_DIR DS41_PORT DS41_API_KEY_FILE
+export DS41_OVERLAY_1017_DIR DS41_OVERLAY_58132_DIR DS41_SITECUSTOMIZE
+export DS41_SERVED DS41_ALIASES DS41_IMAGE
+export DS41_MIN_PCT DS41_MIN_ACC
+
+log()  { printf '[ds41] %s\n' "$*"; }
+warn() { printf '[ds41] WARN: %s\n' "$*" >&2; }
+die()  { printf '[ds41] ERROR: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<EOF
+ds41 — DeepSeek-V4.1-Flash-1017 on a DGX Station GB300 (+ RTX PRO 6000 sidecar)
+
+  ds41 install [--preflight] [--no-model]
+  ds41 up
+  ds41 down
+  ds41 status
+  ds41 verify [--quick|--full] [--skip-gsm8k] [--skip-decode] [--skip-coding]
+  ds41 bench [--quick] [--conc 1,4,8[,16]] [--runs N] [--skip-coding]
+  ds41 bench --full [--out DIR] [--skip STAGE,...] [--reps N] ...   (the full metrics suite; --full --help)
+  ds41 logs [ds41|sidecar|--boot|--kernel]
+  ds41 update
+  ds41 uninstall [--weights]
+
+Configuration: ~/.ds41/config.env (optional; operator knobs are documented in config/ds41.env.example;
+fixed recipe constants live in config/recipe.env).
+The API key lives at ~/.ds41/api-key (mode 600) and is printed only when it is first generated.
+EOF
+}
+
+model_complete() {
+  [ -f "$DS41_MODEL_DIR/config.json" ] || return 1
+  [ -f "$DS41_MODEL_DIR/model.safetensors.index.json" ] || return 1
+  [ "$(find "$DS41_MODEL_DIR" -maxdepth 1 -name 'model-*.safetensors' 2>/dev/null | wc -l)" -ge 48 ]  # allow-2>/dev/null: missing model directory is an incomplete model, not an error
+}
+
+version_ge() { [ "$(printf '%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+
+preflight() {
+  local fails=0 warns=0
+  p() { printf '%-28s %s\n' "$1" "$2"; }
+
+  if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = aarch64 ]; then
+    p platform "PASS (Linux aarch64)"
+  else
+    p platform "FAIL: this recipe needs Linux aarch64 (Grace); found $(uname -s) $(uname -m)"; fails=$((fails+1))
+  fi
+
+  if have docker && docker info >/dev/null 2>&1; then
+    p docker "PASS"
+  else
+    p docker "FAIL: install Docker + the NVIDIA Container Toolkit, and make sure this user can use Docker"; fails=$((fails+1))
+  fi
+
+  if have nvidia-smi; then
+    local drv; drv=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)  # allow-2>/dev/null: probe; an empty driver fails the check below
+    if [ -n "$drv" ] && version_ge 595.58.03 "$drv"; then
+      p driver "PASS ($drv)"
+    else
+      p driver "FAIL: need driver 595.58.03 or newer; found ${drv:-unknown}"; fails=$((fails+1))
+    fi
+    local names; names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)  # allow-2>/dev/null: probe; allow-||-true: empty names fail the GB300/RTX checks
+    if echo "$names" | grep -qi 'GB300'; then
+      p GB300 "PASS"
+    else
+      p GB300 "FAIL: no NVIDIA GB300 visible"; fails=$((fails+1))
+    fi
+    if echo "$names" | grep -qi 'RTX PRO 6000'; then
+      p RTX "PASS"
+    else
+      p RTX "FAIL: found only the GB300 / Fix: install the RTX PRO 6000 (96 GB); the model does not fit in the GB300 alone."
+      fails=$((fails+1))
+    fi
+  else
+    p nvidia-smi "FAIL: install the NVIDIA driver"; fails=$((fails+1))
+  fi
+
+  local mem; mem=$(awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo 2>/dev/null || true)  # allow-2>/dev/null: /proc probe; allow-||-true: empty memory fails below
+  if [ -n "$mem" ] && [ "$mem" -ge 480 ]; then
+    p "host RAM" "PASS (${mem} GiB; 480+ recommended)"
+  elif [ -n "$mem" ] && [ "$mem" -ge 400 ]; then
+    p "host RAM" "WARN: ${mem} GiB; 480+ GiB recommended"; warns=$((warns+1))
+  else
+    p "host RAM" "FAIL: need at least 480 GiB (found ${mem:-unknown} GiB)"; fails=$((fails+1))
+  fi
+
+  local shm; shm=$(df -P /dev/shm 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}' || true)  # allow-2>/dev/null: mount probe; allow-||-true: empty shm fails below
+  if [ -n "$shm" ] && [ "$shm" -ge 16 ]; then
+    p "/dev/shm" "PASS (${shm} GiB free; peer tier)"
+  elif [ -n "$shm" ] && [ "$shm" -ge 8 ]; then
+    p "/dev/shm" "WARN: ${shm} GiB free; 16+ recommended for the peer tier"; warns=$((warns+1))
+  else
+    p "/dev/shm" "FAIL: enlarge /dev/shm to at least 16 GiB"; fails=$((fails+1))
+  fi
+
+  local disk; disk=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}' || true)  # allow-2>/dev/null: filesystem probe; allow-||-true: empty disk fails below
+  local need_disk=500
+  model_complete && need_disk=100
+  if [ -n "$disk" ] && [ "$disk" -ge 700 ]; then
+    p "model disk" "PASS (${disk} GiB free)"
+  elif [ -n "$disk" ] && [ "$disk" -ge "$need_disk" ]; then
+    p "model disk" "WARN: ${disk} GiB free; 700 recommended"; warns=$((warns+1))
+  else
+    p "model disk" "FAIL: need at least ${need_disk} GiB free for the weights (found ${disk:-unknown} GiB)"; fails=$((fails+1))
+  fi
+
+  if have ss; then
+    local port_out
+    if ! port_out=$(ss -ltn "sport = :$DS41_PORT"); then
+      p "port $DS41_PORT" "WARN: cannot inspect listening sockets"; warns=$((warns+1))
+    elif printf '%s\n' "$port_out" | tail -n +2 | grep -q .; then
+      p "port $DS41_PORT" "WARN: already in use (ds41 status)"; warns=$((warns+1))
+    else
+      p "port $DS41_PORT" "PASS (free)"
+    fi
+  else
+    p "port $DS41_PORT" "WARN: ss not installed; cannot check"; warns=$((warns+1))
+  fi
+
+  if docker image inspect "$DS41_IMAGE" >/dev/null 2>&1; then
+    if ds41_assert_compat; then
+      p compat "PASS ($DS41_SUPPORTED_IMAGE; DeepGEMM base hashes)"
+    else
+      p compat "FAIL: image tag or vendored DeepGEMM base hashes"; fails=$((fails+1))
+    fi
+    if ds41_image_layout_ok; then
+      p image "PASS ($DS41_IMAGE; overlay targets)"
+    else
+      p image "FAIL: $DS41_IMAGE lacks v0.31.0 overlay targets; docker pull $DS41_IMAGE"; fails=$((fails+1))
+    fi
+  else
+    p image "WILL PULL ($DS41_IMAGE)"
+    p compat "WILL CHECK AFTER PULL"
+  fi
+
+  if model_complete; then
+    p model "PASS ($DS41_MODEL_DIR)"
+  else
+    p model "WILL DOWNLOAD (~475 GiB; resumes)"
+  fi
+
+  if [ -s "$DS41_API_KEY_FILE" ]; then
+    local mode; mode=$(stat -c '%a' "$DS41_API_KEY_FILE" 2>/dev/null || true)  # allow-2>/dev/null: mode probe; allow-||-true: empty mode becomes a WARN below
+    if [ "$mode" = 600 ]; then p "api key" "PASS (mode 600)"; else p "api key" "WARN: mode ${mode:-unknown}; install fixes it"; warns=$((warns+1)); fi
+  else
+    p "api key" "WILL GENERATE"
+  fi
+
+  if [ -f "$DS41_CONFIG" ]; then p config "PASS ($DS41_CONFIG)"; else p config "WILL CREATE"; fi
+
+  if have openssl; then p openssl "PASS"; else p openssl "FAIL: install openssl (needed for the API key)"; fails=$((fails+1)); fi
+  if have curl; then p curl "PASS"; else p curl "FAIL: install curl"; fails=$((fails+1)); fi
+  if docker image inspect "$DS41_IMAGE" >/dev/null 2>&1; then
+    if ds41_image_numactl_ok; then
+      p numactl "PASS (in image)"
+    else
+      p numactl "FAIL: image lacks numactl"; fails=$((fails+1))
+    fi
+  else
+    p numactl "WILL CHECK AFTER PULL"
+  fi
+
+  if [ "$fails" != 0 ]; then
+    echo "preflight: FAIL ($fails to fix, $warns warnings)"
+    return 1
+  fi
+  if [ "$warns" != 0 ]; then echo "preflight: PASS ($warns warnings)"; else echo "preflight: PASS"; fi
+  return 0
+}
+
+ensure_dirs() {
+  mkdir -p "$DS41_HOME" "$DS41_CACHE_DIR" "$(dirname "$DS41_MODEL_DIR")"
+  chmod 700 "$DS41_HOME"
+}
+
+ensure_config() {
+  if [ ! -f "$DS41_CONFIG" ]; then
+    [ -f "$ROOT/config/ds41.env.example" ] || die "missing $ROOT/config/ds41.env.example"
+    mkdir -p "$(dirname "$DS41_CONFIG")"
+    cp "$ROOT/config/ds41.env.example" "$DS41_CONFIG"
+    sed -i "s#\$HOME/ds41/fastpath#$ROOT/fastpath#g; s#\$HOME/ds41/docker/b12x#$ROOT/docker/b12x#g; s#\$HOME/ds41/docker/overlay-1017#$ROOT/docker/overlay-1017#g; s#\$HOME/ds41/docker/overlay-58132#$ROOT/docker/overlay-58132#g" "$DS41_CONFIG"
+    chmod 600 "$DS41_CONFIG"
+    log "created $DS41_CONFIG (edit it to change defaults)"
+  else
+    log "using $DS41_CONFIG"
+  fi
+}
+
+ensure_key() {
+  mkdir -p "$(dirname "$DS41_API_KEY_FILE")"
+  chmod 700 "$(dirname "$DS41_API_KEY_FILE")"
+  if [ ! -s "$DS41_API_KEY_FILE" ]; then
+    have openssl || die "openssl is required to generate the API key"
+    umask 077
+    openssl rand -hex 24 > "$DS41_API_KEY_FILE"
+    chmod 600 "$DS41_API_KEY_FILE"
+    log "generated API key at $DS41_API_KEY_FILE (keep it private)"
+    echo "API key (save it): $(cat "$DS41_API_KEY_FILE")"
+  else
+    chmod 600 "$DS41_API_KEY_FILE"
+    log "using existing API key at $DS41_API_KEY_FILE (not printed again)"
+  fi
+}
+
+ensure_image() {
+  if ! docker image inspect "$DS41_IMAGE" >/dev/null 2>&1; then
+    log "pulling official image $DS41_IMAGE"
+    docker pull "$DS41_IMAGE" || die "docker pull $DS41_IMAGE failed; check the network/registry"
+  fi
+  ds41_assert_compat || die "image $DS41_IMAGE is not compatible (see above)"
+  ds41_image_layout_ok || die "image $DS41_IMAGE lacks the v0.31.0 overlay targets"
+  ds41_image_numactl_ok || die "image $DS41_IMAGE lacks numactl; this recipe requires the image's /usr/bin/numactl"
+  log "image $DS41_IMAGE is ready (stock image; overlays mount from this checkout)"
+}
+
+ensure_model() {
+  if DS41_MODEL_DIR="$DS41_MODEL_DIR" "$ROOT/scripts/setup_model.sh" --check >/dev/null 2>&1; then
+    log "existing checkpoint verified at $DS41_MODEL_DIR; skipping download"
+  else
+    log "downloading the official checkpoint (resumes if interrupted)"
+    DS41_IMAGE="$DS41_IMAGE" DS41_MODEL_DIR="$DS41_MODEL_DIR" DS41_MODEL_REV="$DS41_MODEL_REV" \
+      "$ROOT/scripts/setup_model.sh"
+  fi
+  DS41_HOOK_DIR="$DS41_HOOK_DIR" "$ROOT/scripts/setup_assets.sh"
+  DS41_MODEL_DIR="$DS41_MODEL_DIR" DS41_CACHE_DIR="$DS41_CACHE_DIR" \
+    "$ROOT/scripts/setup_engram_store.sh"
+}
+
+cmd_install() {
+  local preflight_only=0 no_model=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --preflight) preflight_only=1;;
+      --no-model) no_model=1;;
+      --help|-h) usage; exit 0;;
+      *) die "unknown install option: $1";;
+    esac
+    shift
+  done
+  if [ "$preflight_only" = 1 ]; then preflight; exit $?; fi
+  preflight || die "preflight failed; nothing has been changed"
+  ensure_dirs
+  ensure_config
+  ensure_key
+  ensure_image
+  if [ "$no_model" = 1 ]; then
+    DS41_HOOK_DIR="$DS41_HOOK_DIR" "$ROOT/scripts/setup_assets.sh"
+    log "stopped before the weights (--no-model); run: ds41 install"
+    echo "endpoint when started: http://localhost:$DS41_PORT/v1"
+    return 0
+  fi
+  ensure_model
+  log "installed"
+  echo "endpoint: http://localhost:$DS41_PORT/v1"
+  echo "next: ds41 up"
+}
+
+cmd_up() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h) usage; exit 0;;
+      *) die "unknown up option: $1";;
+    esac
+    shift
+  done
+  [ -x "$ROOT/serve/serve.sh" ] || die "missing $ROOT/serve/serve.sh"
+  [ -f "$DS41_CONFIG" ] || warn "no config at $DS41_CONFIG; using built-in defaults"
+  ensure_key
+  exec "$ROOT/serve/serve.sh" start
+}
+
+cmd_down() {
+  [ -x "$ROOT/serve/serve.sh" ] || die "missing $ROOT/serve/serve.sh"
+  "$ROOT/serve/serve.sh" down
+}
+
+cmd_status() {
+  [ -x "$ROOT/serve/serve.sh" ] || die "missing $ROOT/serve/serve.sh"
+  exec "$ROOT/serve/serve.sh" status
+}
+
+canon_path() { realpath -m "$1"; }
+
+path_within() {
+  local child parent
+  child=$(canon_path "$1")
+  parent=$(canon_path "$2")
+  [ "$parent" = "/" ] && return 0
+  [ "$child" = "$parent" ] && return 0
+  case "$child" in "$parent"/*) return 0;; *) return 1;; esac
+}
+
+# Remove everything under $1 except the path $2 (used to keep weights that live inside ~/.ds41).
+remove_except_path() {
+  local root=$1 keep=$2 rel next
+  [ -d "$root" ] || return 0
+  [ "$root" = "$keep" ] && return 0
+  rel=${keep#"$root"/}
+  [ "$rel" != "$keep" ] || return 0
+  next=${rel%%/*}
+  find "$root" -mindepth 1 -maxdepth 1 ! -name "$next" -exec rm -rf -- {} +
+  if [ "$next" != "$rel" ]; then
+    remove_except_path "$root/$next" "$keep"
+  fi
+}
+
+cmd_uninstall() {
+  local remove_weights=0 ans typed home=${DS41_HOME%/}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --weights) remove_weights=1;;
+      --help|-h) usage; exit 0;;
+      *) die "unknown uninstall option: $1";;
+    esac
+    shift
+  done
+  local hcanon; hcanon=$(canon_path "$home")
+  case "$hcanon" in
+    ""|"/"|"$HOME") die "refusing to uninstall from $DS41_HOME";;
+  esac
+  if [ "$remove_weights" = 0 ] && [ ! -d "$home" ]; then
+    log "nothing to remove at $home"
+    return 0
+  fi
+  echo "This will stop ds41/ds41-sidecar and remove $home."
+  if [ "$remove_weights" = 1 ]; then
+    echo "The weights at $DS41_MODEL_DIR will ALSO be deleted."
+  else
+    echo "The weights at $DS41_MODEL_DIR will be kept."
+  fi
+  read -r -p "Continue? [y/N] " ans || { log "aborted"; return 1; }
+  case "$ans" in y|Y|yes|YES) ;; *) log "aborted"; return 1;; esac
+  if [ "$remove_weights" = 1 ]; then
+    [ -n "$DS41_MODEL_DIR" ] || die "refusing to delete an empty weights path"
+    local wcanon; wcanon=$(canon_path "$DS41_MODEL_DIR")
+    case "$wcanon" in
+      ""|"/"|"$HOME"|"$(canon_path "$DS41_HOME")") die "refusing to delete $DS41_MODEL_DIR";;
+    esac
+    [ -f "$DS41_MODEL_DIR/config.json" ] || die "refusing: no checkpoint config.json at $DS41_MODEL_DIR"
+    read -r -p "Type the full weights path to delete (${DS41_MODEL_DIR}): " typed || { log "aborted"; return 1; }
+    [ "$typed" = "$DS41_MODEL_DIR" ] || die "weights path did not match; nothing removed"
+  fi
+  if [ -x "$ROOT/serve/serve.sh" ]; then
+    "$ROOT/serve/serve.sh" down
+  else
+    warn "missing $ROOT/serve/serve.sh; removing files without stopping containers"
+  fi
+  if [ "$remove_weights" = 0 ] && path_within "$DS41_MODEL_DIR" "$home"; then
+    remove_except_path "$home" "$DS41_MODEL_DIR"
+    log "kept weights at $DS41_MODEL_DIR; removed the rest of $home"
+  else
+    rm -rf -- "$home"
+  fi
+  if [ "$remove_weights" = 1 ]; then
+    rm -rf -- "$DS41_MODEL_DIR"
+    log "removed weights at $DS41_MODEL_DIR"
+  fi
+  log "uninstalled"
+}
+
+cmd_verify() {
+  [ -x "$ROOT/verify/verify.sh" ] || die "missing $ROOT/verify/verify.sh"
+  exec "$ROOT/verify/verify.sh" "$@"
+}
+
+# The environment record of the running server for `bench --full`: what is actually running, read from the
+# container (flags, the recipe env it was given, its boot log), not from the config.  key=value lines; no secrets
+# (only the named variables are read from the container env).
+bench_environment() {
+  local out=$1 args logs
+  args=$(docker inspect -f '{{range .Args}}{{println .}}{{end}}' ds41) || die "cannot inspect container ds41"
+  flag() { awk -v f="$1" 'p { print; exit } $0 == f { p = 1 }' <<< "$args"; }
+  cenv() { docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' ds41 | sed -n "s/^$1=//p"; }
+  logs=$(docker logs ds41 2>&1) || die "cannot read the ds41 boot log"
+  local commit dirty=false kv
+  commit=$(git -C "$ROOT" rev-parse HEAD) || die "cannot read the recipe commit (git)"
+  [ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ] || dirty=true
+  kv=$(grep -oE 'GPU KV cache size: [0-9,]+ tokens' <<< "$logs" | tail -1 | grep -oE '[0-9,]+' | tr -d ,) \
+    || die "the boot log has no 'GPU KV cache size' line"
+  {
+    echo "image=$(docker inspect -f '{{.Config.Image}}' ds41)"
+    echo "image_id=$(docker inspect -f '{{.Image}}' ds41)"
+    echo "container_started=$(docker inspect -f '{{.State.StartedAt}}' ds41)"
+    echo "driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
+    echo "gpus=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | paste -sd';' -)"
+    echo "commit=$commit"
+    echo "tree_dirty=$dirty"
+    echo "util=$(flag --gpu-memory-utilization)"
+    echo "max_model_len=$(flag --max-model-len)"
+    echo "max_num_seqs=$(flag --max-num-seqs)"
+    echo "kv_cache_dtype=$(flag --kv-cache-dtype)"
+    echo "speculative_config=$(flag --speculative-config)"
+    echo "rowmap=$(basename "$(cenv MEGA_ROWMAP)")"
+    echo "fi_tune_file=$(basename "$(cenv MEGA_FI_TUNE_FILE)")"
+    echo "gpu_reserve_mib=$(cenv DS41_GPU_RESERVE_MIB)"
+    echo "components=$(cenv DS41_FASTPATH)"
+    echo "components_active=$(grep -oE '^DS41_FASTPATH ACTIVE [a-z0-9_]+$' <<< "$logs" | awk '{print $3}' | sort -u | paste -sd, -)"
+    echo "kv_cache_tokens=$kv"
+  } > "$out"
+  log "environment: $(grep -E '^(image|util|rowmap|commit|kv_cache_tokens)=' "$out" | paste -sd' ' -)"
+}
+
+cmd_bench_full() {
+  local outdir="$DS41_CACHE_DIR/bench" stamp extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) [ $# -ge 2 ] || die "--out needs a directory"; outdir=$2; shift;;
+      --help|-h) "$ROOT/verify/py.sh" "$ROOT/verify/bench_full.py" --help; exit 0;;
+      *) extra+=("$1");;
+    esac
+    shift
+  done
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  mkdir -p "$outdir"
+  outdir=$(cd "$outdir" && pwd)
+  bench_environment "$outdir/bench-$stamp.env"
+  DS41_PY_MOUNT=$outdir "$ROOT/verify/py.sh" "$ROOT/verify/bench_full.py" --base-url "http://127.0.0.1:$DS41_PORT" \
+    --key-file "$DS41_API_KEY_FILE" --model "$DS41_SERVED" --env-file "$outdir/bench-$stamp.env" \
+    --out "$outdir/bench-$stamp.json" "${extra[@]}"
+}
+
+cmd_bench() {
+  local conc=1,4,8 runs=1 window=60 warmup=20 skip_coding=0 min_pct="$DS41_MIN_PCT"
+  if [ "${1:-}" = --full ]; then
+    shift
+    case " $* " in *" --help "*|*" -h "*) "$ROOT/verify/py.sh" "$ROOT/verify/bench_full.py" --help; return;; esac
+    preflight || die "preflight failed"
+    [ -s "$DS41_API_KEY_FILE" ] || die "no API key at $DS41_API_KEY_FILE; run: ds41 install"
+    curl -fsS -m 10 -H "Authorization: Bearer $(cat "$DS41_API_KEY_FILE")" \
+      "http://127.0.0.1:$DS41_PORT/v1/models" | grep -q "$DS41_SERVED" \
+      || die "server is not serving $DS41_SERVED; run: ds41 up"
+    cmd_bench_full "$@"
+    return
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --quick) window=30; warmup=10;;
+      --conc) [ $# -ge 2 ] || die "--conc needs a value"; conc=$2; shift;;
+      --runs) [ $# -ge 2 ] || die "--runs needs a value"; runs=$2; shift;;
+      --min-pct) [ $# -ge 2 ] || die "--min-pct needs a value"; min_pct=$2; shift;;
+      --skip-coding) skip_coding=1;;
+      --help|-h) usage; exit 0;;
+      *) die "unknown bench option: $1";;
+    esac
+    shift
+  done
+  preflight || die "preflight failed"
+  [ -s "$DS41_API_KEY_FILE" ] || die "no API key at $DS41_API_KEY_FILE; run: ds41 install"
+  curl -fsS -m 10 -H "Authorization: Bearer $(cat "$DS41_API_KEY_FILE")" \
+    "http://127.0.0.1:$DS41_PORT/v1/models" | grep -q "$DS41_SERVED" \
+    || die "server is not serving $DS41_SERVED; run: ds41 up"
+  local py="$ROOT/verify/py.sh"
+  "$py" "$ROOT/verify/decode.py" --base-url "http://127.0.0.1:$DS41_PORT" \
+    --key-file "$DS41_API_KEY_FILE" --model "$DS41_SERVED" \
+    --conc "$conc" --window "$window" --warmup "$warmup" --min-pct "$min_pct"
+  if [ "$skip_coding" = 0 ]; then
+    "$py" "$ROOT/verify/coding.py" --base-url "http://127.0.0.1:$DS41_PORT" \
+      --key-file "$DS41_API_KEY_FILE" --model "$DS41_SERVED" --runs "$runs" --min-pct "$min_pct"
+  fi
+}
+
+cmd_logs() {
+  [ -x "$ROOT/serve/serve.sh" ] || die "missing $ROOT/serve/serve.sh"
+  exec "$ROOT/serve/serve.sh" logs "$@"
+}
+
+cmd_update() {
+  if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+    log "pulling the recipe"
+    git -C "$ROOT" pull --ff-only || die "git pull failed; fix the checkout and re-run"
+  else
+    log "no git remote configured; replace this checkout to update the recipe"
+  fi
+  log "pulling official image $DS41_IMAGE"
+  docker pull "$DS41_IMAGE" || die "image pull failed"
+  echo "Re-run: ds41 install --no-model"
+  echo "Then:    ds41 down && ds41 up"
+}
+
+case "${1:-}" in
+  install) shift; cmd_install "$@";;
+  up) shift; cmd_up "$@";;
+  down) shift; cmd_down "$@";;
+  status) shift; cmd_status "$@";;
+  verify) shift; cmd_verify "$@";;
+  bench) shift; cmd_bench "$@";;
+  logs) shift; cmd_logs "$@";;
+  update) shift; cmd_update "$@";;
+  uninstall) shift; cmd_uninstall "$@";;
+  help|--help|-h) usage;;
+  *) usage; exit 2;;
+esac

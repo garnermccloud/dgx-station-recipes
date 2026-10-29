@@ -1,0 +1,11 @@
+{
+  "reference": "DeepSeek-V4.1-Flash-1017, DGX Station GB300 + RTX PRO 6000, October 2026",
+  "recipe": "the defaults in config/ds41.env.example (fastpath + fastload + peer3 + MegaMoE v11)",
+  "decode_tok_s": {"C1": 467, "C4": 992, "C8": 1369, "C16": 1970},
+  "coding_greedy_off_tok_s": 724.7,
+  "gsm8k_200": {"n": 200, "correct": 196},
+  "needles_200k": "3/3",
+  "tool_call": "PASS",
+  "tolerance_pct": 20,
+  "notes": "C1/C4/C8 are the 2026-10-22 production numbers (prod-numbers-1021); C16 is the 2026-10-23 production reasoning run (prod-c16-1023), using the same temperature 1.0 / top_p 0.95 / thinking-on sampling as verify/decode.py. The default util is 0.95 on a dedicated machine (the references used 0.84 with a co-tenant), so 80% is the floor and faster is normal."
+}

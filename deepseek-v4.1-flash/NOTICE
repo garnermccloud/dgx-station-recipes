@@ -1,0 +1,461 @@
+# Notices, credits and licences
+
+DS41 is a serving recipe for **DeepSeek-V4.1-Flash-1017** on a DGX Station
+GB300 with an RTX PRO 6000 sidecar. It is a lot of small pieces standing on a
+lot of generous work. This file records what is ours, what came from where,
+and what to keep when you redistribute it. It is meant to be readable; the
+full licence texts are in the appendices.
+
+## Our work
+
+Unless a file says otherwise, the original code, scripts, documentation,
+rowmaps, tuning files, measurement data and prebuilt kernels in this
+repository are released under the **MIT License** (see `LICENSE`),
+copyright 2026 Garner McCloud.
+
+You can use, modify and sell this work. Keep the copyright and permission
+notice, and keep the third-party notices below.
+
+## The foundation we build on
+
+### original-el8 — DGX Station GB300 research
+
+The M3 lane comes from **original-el8/dgx-station-gb300-research**, snapshot
+commit `87af662dd0a70f72c250c2085cf12eea2be8d882` (2026-10-07). It is
+**Apache-2.0**. Its `upstream/` tree gave us the shape of the launcher, the
+MegaMoE peer hook, the peer-tier sidecar, the rowmap builders, the calibration
+sets, the fi-tune files and the vLLM #58132 overlay. The Apache-2.0 licence
+covers the hook, the rowmaps and the fi-tune files; the `LICENSE` and `SOURCE`
+are included under `fastpath/hook/`.
+
+The **original-el8 lane** wrote the MegaMoE peer hook and much of the peer-tier work. The
+hook is the part that makes one GB300 and one RTX PRO 6000 behave like one
+machine: hot experts stay on the GB300, cold experts live on the RTX, and the
+two sides meet through a small pinned-memory protocol. Its rowmap tooling and
+calibration sets are the reason the split is balanced rather than guessed. We
+are grateful for both the code and the clear write-ups.
+
+If you redistribute the `upstream/` tree, keep its Apache-2.0 `LICENSE`, its
+`SOURCE` file and this notice. The files also carry their own headers where
+they have one.
+
+### vLLM
+
+**vLLM** is **Apache-2.0** and is the serving engine underneath everything.
+We pin the nightly image
+`vllm/vllm-openai:nightly-af7f9488c2210d67e1033ecdc845b087ee7fe92b`.
+
+The `overlay-58132/` patch is vLLM pull request
+[#58132](https://github.com/vllm-project/vllm/pull/58132), restricted to its
+runtime files. The `overlay-1017/` frontend is derived from the image's vLLM
+files and the checkpoint's own encoder; the files that carry
+`SPDX-License-Identifier: Apache-2.0` remain Apache-2.0. The fastpath hooks
+that patch vLLM classes are our original code unless a header says otherwise.
+
+Thank you to the vLLM team, especially the DeepSeek-V4.1 model, speculative
+decoding and frontend maintainers, and to the authors and reviewers of
+#58132. Their engine made this recipe possible.
+
+### local-inference-lab
+
+**local-inference-lab**'s vLLM fork and their notes on serving large MoE
+models on a single box shaped many of the decisions here: what "good" looks
+like at one stream, which parts of the stack are worth touching, and where the
+fixed costs really are. We did not vendor their vLLM fork; their b12x
+snapshot is vendored separately under `docker/b12x/` with its licence. Their
+vLLM fork is Apache-2.0. Thank you for publishing the notes as well as the
+patches.
+
+### FlashInfer and b12x
+
+**FlashInfer** is **Apache-2.0**. It provides the low-latency MXFP8 GEMM and
+the SM120 fused-MoE path used by the RTX sidecar, and several of our kernels
+follow its CuTe DSL and TRT-LLM patterns. Thank you to the FlashInfer team and
+the kernel authors who made those paths public.
+
+**b12x** started as **Local Inference Lab**'s standalone SM120 inference
+stack and has moved into FlashInfer's experimental tree:
+<https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/experimental/b12x>.
+The standalone upstream is
+<https://github.com/local-inference-lab/b12x> at commit
+`2cc7f66aaef76a9c7cbb660a1efb865cf3f26c88`; the same code now lives in
+FlashInfer. b12x is **Apache-2.0**, with one BSD-3-Clause file
+(`b12x/_lib/dense_gemm.py`, NVIDIA copyright) and other files carrying their
+own notices. A **subset** of that upstream tree is vendored under
+`docker/b12x/` for the image build: every copied file matches the pinned
+commit (a byte-for-byte diff is clean), 159 upstream-only paths are not
+shipped, and there are no local modifications. Its `LICENSE` and the
+BSD-3-Clause notice must travel with it. If you rebuild the image, pin the
+full commit and keep the snapshot's licence files.
+
+### DeepGEMM
+
+**DeepGEMM** is **MIT**, copyright 2025 DeepSeek. The MegaMoE kernel is
+DeepGEMM's; our `megamoe_fork/` is a scheduling-only fork of two headers.
+Every tile's math and the combine order stay stock. The fork keeps the
+DeepGEMM MIT terms. The two modified headers now carry
+`SPDX-License-Identifier: MIT` and `Copyright (c) 2025 DeepSeek`. DeepGEMM also carries CUTLASS headers under the
+**BSD-3-Clause** licence; keep those notices if you redistribute the fork or
+its generated sources.
+
+### TileLang, PyTorch, CUDA and the rest of the stack
+
+- **TileLang** is **MIT**; many of our kernels are written in it.
+- **PyTorch** is **BSD-3-Clause**; the image and the extensions link it.
+- **NVIDIA CUDA / cuBLAS / CUTLASS / TensorRT-LLM** components are covered by
+  NVIDIA's licences and the BSD-3-Clause CUTLASS notice. They are dependencies,
+  not ours to relicense.
+- **DeepSeek-V4.1-Flash-1017** weights are released by DeepSeek under
+  **MIT**. The checkpoint's own `LICENSE` is the MIT text, copyright 2023
+  DeepSeek; we verified it in the downloaded checkpoint. The official model
+  card is:
+  <https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017>. We do not
+  re-upload weights. The checkpoint's `encoding/encoding.py` is included in
+  the 1017 frontend overlay; the checkpoint `LICENSE` (MIT, Copyright 2023
+  DeepSeek) covers it. Keep the MIT notice with it.
+- **GSM8K** is OpenAI's grade-school-math dataset, released under **MIT**.
+  The RonanLabs harness copy used by the benchmark is **Apache-2.0** and keeps
+  its `LICENSE.ronanlabs` and `SOURCE.ronanlabs`; keep both. Thank you to the
+  GSM8K authors and to RonanLabs for the test file.
+
+### RonanLabs — the sibling launcher
+
+**RonanLabsAI/dgx-station-frontier** is the closest sibling to this recipe.
+We learned the stale-buffer cleanup, the FlashInfer JIT cache mount and the
+bring-up gate from their launcher, and their public results gave us a sanity
+check on the same hardware lane. Their repository is **Apache-2.0** for the
+whole tree, which covers those launcher ideas as well as the GSM8K harness.
+The harness's `LICENSE.ronanlabs` and `SOURCE` are included under
+`verify/data/`; keep both. Thank you.
+
+### BRRR — the fixed bench prompt
+
+The single-stream prompt of `bench --full` (`verify/data/fixed_prompt.txt`) is
+the coding task from **Fraser Price's BRRR** bench
+(<https://huggingface.co/fraserprice/DeepSeek-4.1-Flash-1017-BRRR>,
+`src/brrr/bench.py`), repeated ten times. BRRR is **Apache-2.0**; its
+`LICENSE.brrr` and `SOURCE.brrr` are included under `verify/data/`; keep both.
+Using the same prompt means single-stream numbers can be read against that
+bench's. Thank you.
+
+## Licence map for the release tree
+
+| Path | What it is | Licence / notice |
+|---|---|---|
+| `ds41`, `config/`, `serve/`, `scripts/` | CLI, config example, launcher and helper scripts | MIT (ours) |
+| `tools/fitune/` | FlashInfer tune-file generator, bitwise gate and helpers | MIT (ours); generated tune files are Apache-2.0 (original-el8 fi-tune data) |
+| `tools/profiling/` | CPU-only trace/timeline analysis helpers | MIT (ours) |
+| `fastpath/*.py`, `fastpath/peer3/`, `fastpath/w1attn/`, `fastpath/w3preattn/`, `fastpath/*.so` | our fastpath components and prebuilt kernels | MIT (ours), except files with a third-party header |
+| `fastpath/megamoe_fork/` | DeepGEMM scheduling fork; two modified headers | MIT (DeepGEMM); SPDX + copyright added; CUTLASS BSD-3-Clause where present |
+| `fastpath/peer3/csrc/` | our peer-tier kernels | MIT (ours) |
+| `fastpath/hook/` | original-el8 MegaMoE peer hook; includes `LICENSE`/`SOURCE` | Apache-2.0 |
+| `kernels/` | our standalone kernel sources (peer3, W1/W3, W4/W6/W8) | MIT (ours), except files with a third-party header |
+| `docker/README.md` | stock-image launch notes | MIT (ours) |
+| `docker/overlay-58132/` | vLLM #58132 runtime patch | Apache-2.0 (vLLM) |
+| `docker/overlay-1017/vllm/` | vLLM frontend files | Apache-2.0 (vLLM); encoder file follows DeepSeek's release |
+| `docker/overlay-1017/vllm/tokenizers/deepseek_v41_encoding.py` | checkpoint encoder, plus `xhigh` alias | MIT (checkpoint `LICENSE`) |
+| `docker/b12x/` | vendored subset of `local-inference-lab/b12x@2cc7f66a` | Apache-2.0; `_lib/dense_gemm.py` BSD-3-Clause; no local modifications |
+| `fastpath/hook/rowmap-*.json`, `fastpath/hook/fi-tune/*.json` | original-el8 rowmaps/tuning files | Apache-2.0 |
+| `verify/*.py`, `verify/verify.sh`, `verify/README.md` | verification code and docs | MIT (ours) |
+| `verify/data/` | GSM8K test file and its `LICENSE.ronanlabs`/`SOURCE.ronanlabs` | harness Apache-2.0; questions MIT |
+| `verify/data/fixed_prompt.txt` | BRRR's coding task, repeated ten times; `LICENSE.brrr`/`SOURCE.brrr` | Apache-2.0 (Fraser Price, BRRR) |
+| `fastpath/THIRD_PARTY.md` | third-party notice maintained with the fastpath tree | MIT for our text; third-party notices as listed |
+| `README.md`, `ACKNOWLEDGEMENTS.md`, `RESULTS.md` | our user-facing docs | MIT (ours) |
+| `hf/MODEL_CARD.md` | our Hugging Face model card | MIT (our text and model metadata; weights MIT) |
+| `docs/` | our architecture, limitations and negative-results docs | MIT (ours) |
+| `NOTICE`, `LICENSE`, `tools/scrub/`, `tools/release/` | this notice, licence, scrub and release-validation tooling | MIT (ours) |
+
+If a directory is added outside this map, add a row before publishing. If a
+file carries an SPDX header or a copyright line, that header wins over this
+table.
+
+## What we do not ship
+
+- Model weights. The model card links to DeepSeek's official release; the
+  weights licence is DeepSeek's, not this repository's.
+- A copy of the vLLM, FlashInfer or DeepGEMM source trees (except the small
+  DeepGEMM fork headers and the vLLM overlay files described above). The b12x
+  snapshot under `docker/b12x/` is vendored with its own `LICENSE`.
+- API keys, credentials, private certificates, site configuration or
+  machine-specific paths. The installer generates a fresh API key on your box.
+- Third-party benchmark data beyond the GSM8K test file and BRRR's coding
+  prompt, which keep their Apache-2.0 `LICENSE` and `SOURCE` files.
+
+## If you redistribute
+
+1. Keep `LICENSE` and `NOTICE` with the code.  This release does not build an image; if you redistribute a container, include them in it.
+2. Keep the Apache-2.0 and BSD-3-Clause notices for the files that need them.
+3. Keep the copyright headers in the original-el8, vLLM, DeepGEMM, b12x,
+   FlashInfer, TileLang and GSM8K files.
+4. Do not use the names of the upstream authors or projects to imply
+   endorsement of your fork.
+5. The release uses the stock `vllm/vllm-openai:v0.31.0` image and does not
+   build one.  If you build a derivative container, include this `NOTICE` and
+   `LICENSE` in it; the base image contains vLLM, FlashInfer, TileLang,
+   PyTorch and CUDA, whose notices travel with it.
+
+## Provenance checked
+
+- **RonanLabsAI/dgx-station-frontier** — **Apache-2.0** for the whole
+  repository, covering the launcher ideas and the GSM8K harness.
+- **original-el8/dgx-station-gb300-research** — **Apache-2.0**, covering the
+  MegaMoE peer hook, rowmaps and fi-tune files.
+- **deepseek-ai/DeepGEMM** — **MIT**; the fork headers match, and the two
+  modified headers carry `SPDX-License-Identifier: MIT` and the DeepSeek
+  copyright line.
+- **Checkpoint repository** — **MIT**, Copyright (c) 2023 DeepSeek; covers
+  `encoding/encoding.py` shipped in the overlay.
+- **local-inference-lab/b12x** — **Apache-2.0**; unmodified subset at
+  `2cc7f66a`.
+
+The release does not publish or build a serving image; `NOTICE` and `LICENSE`
+stay in the repo alongside the mounted recipe.  The official base image carries
+its own licence files.
+
+## Thank you
+
+This recipe exists because people published their kernels, their failures and
+their hard-won numbers. Thank you to DeepSeek for the model and DeepGEMM, to
+the vLLM and FlashInfer teams, to local-inference-lab and the b12x authors, to
+original-el8, to RonanLabs, to the TileLang and CUTLASS teams, and
+to everyone who wrote down what did not work. That last part saved us months.
+
+---
+
+## Appendix: Apache License 2.0
+
+
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+---
+
+## Appendix: BSD 3-Clause (b12x `_lib/dense_gemm.py` / CUTLASS)
+
+
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# This file is ported from the CUTLASS dense block-scaled GEMM example
+# and adapted for the current Blackwell GeForce target.

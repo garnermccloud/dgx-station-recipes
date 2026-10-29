@@ -1,0 +1,7 @@
+Source of verify/data/fixed_prompt.txt
+
+Repository: https://huggingface.co/fraserprice/DeepSeek-4.1-Flash-1017-BRRR (Fraser Price), Apache-2.0
+Commit: 0bc4dbd (2026-10-25)
+File: src/brrr/bench.py, CODE_TASK
+
+fixed_prompt.txt is that coding task repeated ten times (~2.6K tokens), unchanged otherwise.
