@@ -1,7 +1,7 @@
-# DeepSeek-V4.1-Flash on a DGX Station GB300 (with an RTX PRO 6000 sidecar)
+# DeepSeek-V4.1-Flash-1017 on a DGX Station GB300 (with an RTX PRO 6000 sidecar)
 
 This repo turns one NVIDIA DGX Station GB300 plus one RTX PRO 6000 into a fast, private
-DeepSeek-V4.1-Flash server: an OpenAI-compatible endpoint that does **~730 tok/s single-stream on code**
+[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) server: an OpenAI-compatible endpoint that does **~730 tok/s single-stream on code**
 (~500 on sampled reasoning), **~1,370 tok/s at 8 concurrent streams** and **~2,500 at 32**, with an
 11.4-million-token KV cache and the model's weights split across the two GPUs by a peer tier
 (hot experts on the GB300, cold experts on the RTX) and a set of kernel-level fast paths. Most replace a kernel
